@@ -94,7 +94,8 @@ def receive_sr_alert():
     
     Formato esperado:
     {
-        "event": "SR_TABLE_UPDATE" | "SR_LOCAL" | "SR_CONFIRMED",
+        "current_price": 4595.40,
+        "event": "SR_TABLE_UPDATE" | "SR_LOCAL" | "SR_POSSIBLE",
         "symbol": "XAUUSD",
         "tf_minutes": 15,
         "resistances": [{"n": "R1", "p": 4620.50, "q": 5, "time": "..."}],
@@ -110,6 +111,7 @@ def receive_sr_alert():
         event = data.get('event', 'UNKNOWN')
         symbol = data.get('symbol', '').replace('/', '').upper()
         tf_minutes = data.get('tf_minutes', 15)
+        current_price = data.get('current_price', 0)
         
         if not symbol:
             symbol = data.get('new_level', {}).get('symbol', 'UNKNOWN')
@@ -119,24 +121,37 @@ def receive_sr_alert():
         # Procesar según tipo de evento
         if event in ['SR_TABLE_UPDATE', 'SR_CONFIRMED']:
             # Evento con tabla completa de S/R
-            save_sr_levels(symbol, data, tf_minutes)
+            save_sr_levels(symbol, data, tf_minutes, current_price)
             return jsonify({
                 "status": "ok",
                 "event": event,
                 "symbol": symbol,
+                "current_price": current_price,
                 "resistances": len(data.get('resistances', [])),
                 "supports": len(data.get('supports', []))
             }), 200
             
         elif event == 'SR_LOCAL':
             # Evento de detección temprana
-            update_local_sr(symbol, data, tf_minutes)
+            update_local_sr(symbol, data, tf_minutes, current_price)
             return jsonify({
                 "status": "ok",
                 "event": event,
                 "symbol": symbol,
+                "current_price": current_price,
                 "type": data.get('type', 'UNKNOWN'),
                 "price": data.get('price', 0)
+            }), 200
+        
+        elif event == 'SR_POSSIBLE':
+            # Evento de posible S/R (más temprano)
+            save_possible_sr(symbol, data, tf_minutes, current_price)
+            return jsonify({
+                "status": "ok",
+                "event": event,
+                "symbol": symbol,
+                "current_price": current_price,
+                "possible": data.get('possible', {})
             }), 200
             
         else:
@@ -199,13 +214,18 @@ def list_all_sr():
 
 # ========== FUNCIONES AUXILIARES ==========
 
-def save_sr_levels(symbol: str, data: dict, tf_minutes: int = 15):
+def save_sr_levels(symbol: str, data: dict, tf_minutes: int = 15, current_price: float = 0):
     """Guarda los niveles S/R en archivo JSON Y en SQLite"""
     filepath = os.path.join(SR_DATA_DIR, f'{symbol}_sr.json')
     
     # Añadir metadata
     data['last_updated'] = datetime.now().isoformat()
     data['symbol'] = symbol
+    if current_price > 0:
+        data['current_price'] = current_price
+        data['current_price_time'] = datetime.now().isoformat()
+        # Guardar historial para ML
+        save_price_history(symbol, current_price, data.get('event', 'SR_TABLE_UPDATE'), data)
     
     # Normalizar resistances y supports para aceptar ambos formatos:
     # Formato 1: [3250.5, 3260.0, 3275.0]  (array de números)
@@ -250,7 +270,7 @@ def save_sr_levels(symbol: str, data: dict, tf_minutes: int = 15):
     logger.info(f"✅ Guardados {r_count}R + {s_count}S para {symbol} (JSON + {db_saved} en DB)")
 
 
-def update_local_sr(symbol: str, data: dict, tf_minutes: int = 15):
+def update_local_sr(symbol: str, data: dict, tf_minutes: int = 15, current_price: float = 0):
     """Actualiza S/R local (añade a existentes si no es duplicado)"""
     filepath = os.path.join(SR_DATA_DIR, f'{symbol}_sr.json')
     
@@ -283,7 +303,8 @@ def update_local_sr(symbol: str, data: dict, tf_minutes: int = 15):
             "p": price,
             "time": data.get('time', datetime.now().strftime('%d %b %H:%M')),
             "q": 1,  # Calidad baja (no confirmado)
-            "confirmed": False
+            "confirmed": False,
+            "current_price": current_price if current_price > 0 else None
         }
         existing[list_key].insert(0, new_level)
         
@@ -295,9 +316,77 @@ def update_local_sr(symbol: str, data: dict, tf_minutes: int = 15):
         with open(filepath, 'w') as f:
             json.dump(existing, f, indent=2)
         
-        logger.info(f"📍 Añadido SR_LOCAL: {sr_type} @ {price} para {symbol}")
+        logger.info(f"📍 Añadido SR_LOCAL: {sr_type} @ {price} para {symbol} (precio actual: {current_price})")
+        # Guardar historial para ML
+        if current_price > 0:
+            save_price_history(symbol, current_price, 'SR_LOCAL', data)
     else:
         logger.info(f"⏭️ Nivel duplicado ignorado: {sr_type} @ {price}")
+
+
+def save_possible_sr(symbol: str, data: dict, tf_minutes: int = 15, current_price: float = 0):
+    """Guarda evento SR_POSSIBLE para análisis temprano"""
+    raw_dir = os.path.join(SR_DATA_DIR, 'possible')
+    os.makedirs(raw_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filepath = os.path.join(raw_dir, f'{symbol}_{timestamp}.json')
+    
+    # Enriquecer con current_price
+    data['current_price'] = current_price
+    data['timestamp'] = datetime.now().isoformat()
+    
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    # Guardar historial para ML
+    if current_price > 0:
+        save_price_history(symbol, current_price, 'SR_POSSIBLE', data)
+    
+    possible = data.get('possible', {})
+    logger.info(f"🔮 SR_POSSIBLE: {possible.get('type', '?')} @ {possible.get('p', 0)} para {symbol} (precio: {current_price})")
+
+
+def save_price_history(symbol: str, current_price: float, event: str, data: dict):
+    """Guarda historial de precios con contexto S/R para entrenamiento ML"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Crear tabla si no existe
+        cursor.execute('''CREATE TABLE IF NOT EXISTS sr_price_history (
+            id INTEGER PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            current_price REAL NOT NULL,
+            event_type TEXT NOT NULL,
+            sr_type TEXT,
+            sr_price REAL,
+            distance_to_sr REAL,
+            resistances TEXT,
+            supports TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        # Extraer datos del evento
+        sr_type = data.get('type') or data.get('possible', {}).get('type', '')
+        sr_price = data.get('price') or data.get('possible', {}).get('p', 0)
+        distance = abs(current_price - sr_price) if sr_price else None
+        
+        # Serializar resistencias y soportes
+        resistances = json.dumps(data.get('resistances', []))
+        supports = json.dumps(data.get('supports', []))
+        
+        cursor.execute('''
+            INSERT INTO sr_price_history 
+            (symbol, current_price, event_type, sr_type, sr_price, distance_to_sr, resistances, supports)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (symbol, current_price, event, sr_type, sr_price, distance, resistances, supports))
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"📊 Historial ML guardado: {symbol} @ {current_price} ({event})")
+    except Exception as e:
+        logger.error(f"Error guardando historial ML: {e}")
 
 
 def save_raw_event(symbol: str, data: dict):
