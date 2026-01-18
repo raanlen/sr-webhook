@@ -114,7 +114,11 @@ def receive_sr_alert():
         current_price = data.get('current_price', 0)
         
         if not symbol:
-            symbol = data.get('new_level', {}).get('symbol', 'UNKNOWN')
+            new_level = data.get('new_level', {})
+            if isinstance(new_level, dict):
+                symbol = new_level.get('symbol', 'UNKNOWN')
+            else:
+                symbol = 'UNKNOWN'
         
         logger.info(f"📥 Alerta recibida: {event} para {symbol}")
         
@@ -367,10 +371,31 @@ def save_price_history(symbol: str, current_price: float, event: str, data: dict
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         
-        # Extraer datos del evento
-        sr_type = data.get('type') or data.get('possible', {}).get('type', '')
-        sr_price = data.get('price') or data.get('possible', {}).get('p', 0)
-        distance = abs(current_price - sr_price) if sr_price else None
+        # Extraer datos del evento (con verificación de tipos)
+        sr_type = ''
+        sr_price = 0
+        
+        # Verificar tipo de data.get('type')
+        if data.get('type'):
+            sr_type = data.get('type', '')
+        
+        # Verificar si possible es un dict antes de acceder
+        possible = data.get('possible', {})
+        if isinstance(possible, dict) and not sr_type:
+            sr_type = possible.get('type', '')
+            sr_price = possible.get('p', 0)
+        
+        # Verificar si new_level es un dict
+        new_level = data.get('new_level', {})
+        if isinstance(new_level, dict) and not sr_type:
+            sr_type = new_level.get('type', '')
+            sr_price = new_level.get('price', 0) or sr_price
+        
+        # Fallback a price si existe
+        if not sr_price and data.get('price'):
+            sr_price = data.get('price', 0)
+            
+        distance = abs(current_price - sr_price) if sr_price and current_price else None
         
         # Serializar resistencias y soportes
         resistances = json.dumps(data.get('resistances', []))
