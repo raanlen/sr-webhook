@@ -12,6 +12,14 @@ import sqlite3
 from datetime import datetime
 import logging
 
+# Importar ML Signal Generator
+try:
+    from ml_signal_generator import process_sr_event, format_signal_telegram
+    ML_ENABLED = True
+except ImportError:
+    ML_ENABLED = False
+    print("⚠️ ML Signal Generator no disponible")
+
 # ========== CONFIGURACIÓN ==========
 # Variables de entorno para Docker/EasyPanel, con defaults para desarrollo local
 PORT = int(os.environ.get('PORT', 5000))
@@ -138,13 +146,25 @@ def receive_sr_alert():
         elif event == 'SR_LOCAL':
             # Evento de detección temprana
             update_local_sr(symbol, data, tf_minutes, current_price)
+            
+            # 🤖 TRIGGER ML SIGNAL GENERATOR
+            ml_signal = None
+            if ML_ENABLED and current_price > 0:
+                try:
+                    ml_signal = process_sr_event(symbol, current_price, data)
+                    if ml_signal and ml_signal.get('signal'):
+                        logger.info(f"🎯 SEÑAL ML GENERADA: {ml_signal['signal']} {symbol}")
+                except Exception as e:
+                    logger.error(f"Error ML: {e}")
+            
             return jsonify({
                 "status": "ok",
                 "event": event,
                 "symbol": symbol,
                 "current_price": current_price,
                 "type": data.get('type', 'UNKNOWN'),
-                "price": data.get('price', 0)
+                "price": data.get('price', 0),
+                "ml_signal": ml_signal.get('signal') if ml_signal else None
             }), 200
         
         elif event == 'SR_POSSIBLE':
