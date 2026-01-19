@@ -111,10 +111,28 @@ def receive_sr_alert():
     }
     """
     try:
-        data = request.get_json()
+        # TradingView envía como text/plain, no application/json
+        # Intentar parsear de múltiples formas
+        data = None
+        
+        # Método 1: Intentar get_json con force=True (ignora Content-Type)
+        try:
+            data = request.get_json(force=True, silent=True)
+        except:
+            pass
+        
+        # Método 2: Si falla, parsear el body como texto
+        if not data:
+            try:
+                raw_data = request.data.decode('utf-8')
+                if raw_data:
+                    data = json.loads(raw_data)
+                    logger.info(f"📨 JSON parseado desde texto plano")
+            except Exception as e:
+                logger.error(f"Error parseando body: {e}")
         
         if not data:
-            return jsonify({"error": "No JSON data received"}), 400
+            return jsonify({"error": "No JSON data received", "content_type": request.content_type}), 400
         
         event = data.get('event', 'UNKNOWN')
         symbol = data.get('symbol', '').replace('/', '').upper()
